@@ -33,8 +33,11 @@ pub fn load(dirs: &[PathBuf], names: &[String]) -> Result<Vec<PathBuf>> {
             .ok_or_else(|| anyhow!("{file} is in none of {dirs:?}"))?;
         let graph = parse_dep(dir)?;
         for m in graph.load_order(std::slice::from_ref(&file)) {
+            // 依赖未必与本模块同目录：一加 13 的 rfkill.ko 在 system_dlkm，
+            // 而 qca_cld3_peach_v2.ko 在 vendor_dlkm。本目录找不到时扫全部目录。
             let path = graph
                 .resolve_path(&m)
+                .or_else(|| dirs.iter().map(|d| d.join(&m)).find(|p| p.is_file()))
                 .ok_or_else(|| anyhow!("{m} is listed in {}/modules.dep but missing", dir.display()))?;
             insmod(&path, "")?;
             loaded.push(path);
