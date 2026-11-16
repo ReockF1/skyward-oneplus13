@@ -1550,7 +1550,14 @@ impl<'a> Pages<'a> {
         // libraries the supplicant does not start, and the WLAN page says why.
         if let Some(w) = &cfg.wlan {
             self.app.state.wlan = Some(Wlan::default());
-            let modules = cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
+            let mut modules = cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
+            // 一加 13 把内核自己的模块放在 /system_dlkm/lib/modules（没有 flatten 那层）。
+            // 只给 WLAN 追加这个目录：rfkill.ko 在那里，而全局的模块加载保持原样，
+            // 免得 system_dlkm 的模块与 vendor_dlkm 的版本冲突、把 key 链弄断。
+            let system_dlkm = std::path::PathBuf::from("/system_dlkm/lib/modules");
+            if system_dlkm.is_dir() && !modules.contains(&system_dlkm) {
+                modules.push(system_dlkm);
+            }
             let libraries = secure::libraries().unwrap_or_else(|e| {
                 let _ = skyward_sys::kmsg(&format!("the vendor interface's libraries are not open: {e:#}"));
                 None
