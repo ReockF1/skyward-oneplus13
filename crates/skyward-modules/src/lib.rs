@@ -10,13 +10,19 @@ pub mod modprobe;
 /// partitions where they are mounted, and the kernel's own modules in
 /// system_dlkm, which it also keeps in one folder.
 pub fn source_dir(source: &str) -> Result<PathBuf> {
-    Ok(PathBuf::from(match source {
-        "vendor_boot" => "/lib/modules",
-        "vendor_dlkm" => "/vendor_dlkm/lib/modules",
-        "vendor" => "/vendor/lib/modules",
-        "system_dlkm" => "/system_dlkm/flatten/lib/modules",
+    // 一加 13 把内核自己的模块放在 /system_dlkm/lib/modules，
+    // 而不是上游假设的 /system_dlkm/flatten/lib/modules。
+    let candidates: &[&str] = match source {
+        "vendor_boot" => &["/lib/modules"],
+        "vendor_dlkm" => &["/vendor_dlkm/lib/modules"],
+        "vendor" => &["/vendor/lib/modules"],
+        "system_dlkm" => &["/system_dlkm/lib/modules", "/system_dlkm/flatten/lib/modules"],
         _ => bail!("unknown module source {source:?}"),
-    }))
+    };
+    if let Some(found) = candidates.iter().map(Path::new).find(|p| p.is_dir()) {
+        return Ok(found.to_path_buf());
+    }
+    Ok(PathBuf::from(candidates[0]))
 }
 
 /// Load `names` (module names without `.ko`) with their dependencies. Each
