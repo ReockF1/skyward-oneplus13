@@ -631,7 +631,10 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
         for path in skyward_modules::load(modules, &cfg.modules)? {
             skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
         }
-        for w in &cfg.writes {
+        if cfg.unblock {
+        unblock_radio();
+    }
+    for w in &cfg.writes {
             fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))?;
         }
         let until = Instant::now() + INTERFACE_WAIT;
@@ -721,4 +724,17 @@ fn end(child: &mut Child, control: Option<&Control>) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// 把每个 rfkill 的软封锁写 0：驱动起来后无线电仍是 soft blocked，
+/// 不解除的话 supplicant 扫不到任何网络。
+fn unblock_radio() {
+    if let Ok(entries) = std::fs::read_dir("/sys/class/rfkill") {
+        for e in entries.flatten() {
+            let soft = e.path().join("soft");
+            if soft.exists() {
+                let _ = std::fs::write(&soft, "0");
+            }
+        }
+    }
 }

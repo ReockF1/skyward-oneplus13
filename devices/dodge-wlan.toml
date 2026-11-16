@@ -1,0 +1,65 @@
+[device]
+codename = "OP5D0DL1"
+brand = "OnePlus"
+model = "OnePlus 13"
+ab = true
+os_version_prop = "ro.build.display.id"
+
+[display]
+width = 1440
+height = 3168
+density = 560
+diagonal = 6.82
+corner_radius = 0
+
+[firmware]
+partition = "modem"
+
+[partitions]
+mounted = ["persist"]
+
+[[service]]
+path = "/odm/bin/hw/vendor.oplus.hardware.nfc_aidl-service"
+libraries = ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw", "/odm/lib64"]
+user = "nfc"
+groups = ["nfc"]
+ready_service = "vendor.oplus.hardware.nfc.IOplusNfc/default"
+
+[[service]]
+path = "/odm/bin/hw/vendor.oplus.hardware.nfcExtns-service"
+libraries = ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw", "/odm/lib64"]
+user = "system"
+groups = ["nfc", "system"]
+ready_service = "vendor.oplus.hardware.nfcExtns.INfcExtns/default"
+
+[[service]]
+path = "/odm/bin/hw/android.hardware.nfc-service.nxp"
+libraries = ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw", "/odm/lib64"]
+user = "nfc"
+groups = ["nfc", "drmrpc", "system"]
+ready_service = "android.hardware.nfc.INfc/default"
+
+[[owners]]
+user = "nfc"
+group = "nfc"
+mode = 0o660
+paths = ["/dev/nq-nci"]
+
+[modules]
+sources = ["vendor_boot", "vendor_dlkm", "vendor", "system_dlkm"]
+load = ["oplus_bsp_synaptics_tcm2", "nxp-nci"]
+
+# WLAN：Qualcomm Peach（PCIe），cnss2 + qca_cld3_peach_v2，
+# rfkill 由 system_dlkm 提供，须先于驱动加载。
+[wlan]
+modules = ["rfkill", "qca_cld3_peach_v2"]
+writes = [{ path = "/sys/kernel/cnss/fs_ready", value = "1" }]
+unblock = true
+firmware = [
+    { name = "wlan/qca_cld/peach_v2/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/peach_v2/WCNSS_qcom_cfg.ini" },
+]
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+libraries = ["/vendor/lib64", "/system/lib64"]
+service = "android.hardware.wifi.supplicant.ISupplicant/default"
+probe = "http://connect.rom.miui.com/generate_204"

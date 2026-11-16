@@ -129,6 +129,11 @@ pub struct Wlan {
     /// The page the stock system asks over plain HTTP to tell whether a
     /// network reaches the internet, which answers 204 with nothing.
     pub probe: String,
+    /// Unblock the radio once the driver is in: the driver leaves it soft
+    /// blocked until its firmware is up, which a recovery reaches later
+    /// than the system does.
+    #[serde(default)]
+    pub unblock: bool,
 }
 
 /// A value written to a file, such as a switch in sysfs.
