@@ -22,6 +22,7 @@
 | 型号 | OnePlus 13 中国版 `PJZ110` |
 | 代号 / 设备串 | `dodge` / `OP5D0DL1` |
 | 系统 | ColorOS 17 / Android 17，内核 6.6.118 |
+| **底座版本** | **PJZ110 17.0.0.103(CN01)**（原厂 `recovery.img` 取自该系统） |
 | 面板 | `qcom,mdss_dsi_panel_AA569_P_3_A0019_dsc_cmd`（cmd，DSC） |
 | boot 头 | v4，`kernel_size=0`，ramdisk LZ4 legacy |
 
