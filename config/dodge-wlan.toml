@@ -63,3 +63,12 @@ supplicant = "/vendor/bin/hw/wpa_supplicant"
 libraries = ["/vendor/lib64", "/system/lib64"]
 service = "android.hardware.wifi.supplicant.ISupplicant/default"
 probe = "http://connect.rom.miui.com/generate_204"
+
+# 拉起调制解调器（remoteproc1）：WLAN 的校准数据要经 QMI/DMS 从它那里取，
+# 不放它起来的话 cnss 会一直 "deferred for Calibration"，wlan0 不出现。
+[[service]]
+path = "/system/bin/sh"
+args = ["-c", "echo start > /sys/class/remoteproc/remoteproc1/state; sleep 2"]
+oneshot = true
+user = "root"
+groups = ["root"]
