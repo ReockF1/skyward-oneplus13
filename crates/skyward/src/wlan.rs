@@ -692,8 +692,8 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
         .env("LD_LIBRARY_PATH", path.join(":"))
         .current_dir("/")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log_file(&home.join("wpa_supplicant.log"))?))
+        .stderr(Stdio::from(log_file(&home.join("wpa_supplicant.log"))?))
         .spawn()
         .with_context(|| format!("start {}", cfg.supplicant))?;
     let until = Instant::now() + SOCKET_WAIT;
@@ -737,4 +737,13 @@ fn unblock_radio() {
             }
         }
     }
+}
+
+/// 打开（或创建）supplicant 的日志文件：它退出时留下的输出是判断原因的唯一线索。
+fn log_file(path: &std::path::Path) -> Result<fs::File> {
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))
 }
