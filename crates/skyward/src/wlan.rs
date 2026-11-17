@@ -746,8 +746,24 @@ impl Station {
 /// Load the driver where its interface is not there yet, and bring the
 /// interface up.
 
+/// 硬复位不经过 panic，什么都留不下。让可能存在的 oops 直接升级成 panic：
+/// 只有真出了 oops 才会触发，平时没有任何影响；一旦触发，ramoops 也许能落一份。
+fn arm_the_kernel() {
+    for (path, value) in [("/proc/sys/kernel/panic_on_oops", "1"), ("/proc/sys/kernel/panic", "20")] {
+        match fs::write(path, value) {
+            Ok(()) => {
+                let _ = skyward_sys::kmsg(&format!("wlan: {path} set to {value}"));
+            }
+            Err(e) => {
+                let _ = skyward_sys::kmsg(&format!("wlan: cannot set {path}: {e}"));
+            }
+        }
+    }
+}
+
 fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
     mirror_kernel_log();
+    arm_the_kernel();
     let net = Path::new("/sys/class/net").join(&cfg.interface);
     if !net.exists() {
         for file in &cfg.firmware {
