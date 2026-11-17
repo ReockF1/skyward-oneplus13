@@ -936,6 +936,33 @@ fn start_cnss_daemon() {
     }
 }
 
+/// 单变量实验用：往放好的 WCNSS ini 尾巴上补这几行。
+/// 一版只改一项，别夹带。
+const WLAN_INI_EXTRA: [&str; 1] = ["gEnableWoW=0"];
+
+fn tune_ini(cfg: &Config) {
+    if !Path::new("/mnt/system/system/lib64").is_dir() {
+        return;
+    }
+    for file in &cfg.firmware {
+        let to = Path::new(FIRMWARE).join(&file.name);
+        if to.extension().is_some_and(|ext| ext == "ini") {
+            match fs::OpenOptions::new().append(true).open(&to) {
+                Ok(mut ini) => {
+                    for line in WLAN_INI_EXTRA {
+                        if writeln!(ini, "{line}").is_ok() {
+                            let _ = skyward_sys::kmsg(&format!("wlan: ini += {line}"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = skyward_sys::kmsg(&format!("wlan: cannot tune {}: {e}", to.display()));
+                }
+            }
+        }
+    }
+}
+
 fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
     mirror_kernel_log();
     arm_the_kernel();
@@ -944,6 +971,7 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
         for file in &cfg.firmware {
             place(file)?;
         }
+        tune_ini(cfg);
         start_cnss_daemon();
         for path in skyward_modules::load(modules, &cfg.modules)? {
             skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
