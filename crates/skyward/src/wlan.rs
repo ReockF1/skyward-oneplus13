@@ -774,25 +774,6 @@ impl Station {
 
 /// Load the driver where its interface is not there yet, and bring the
 /// interface up.
-/// 一加 13：恢复里不走休眠，固件那套唤醒/挂起处理反而会让驱动在空闲几分钟后
-/// 连着 IPA 一起失手（日志最后一行是 dp_ipa_set_perf_level 失败）。往放好的 ini
-/// 尾巴上补两行关掉它们。
-fn calm_the_driver(cfg: &Config) {
-    if !Path::new(REAL_LIB).is_dir() {
-        return;
-    }
-    for file in &cfg.firmware {
-        let to = Path::new(FIRMWARE).join(&file.name);
-        if to.extension().is_some_and(|ext| ext == "ini") {
-            if let Ok(mut ini) = fs::OpenOptions::new().append(true).open(&to) {
-                let _ = writeln!(ini, "gEnableWoW=0");
-                let _ = writeln!(ini, "gEnableSapSuspend=0");
-                let _ = skyward_sys::kmsg(&format!("wlan: WoW and SAP suspend turned off in {}", to.display()));
-            }
-        }
-    }
-}
-
 /// 恢复里没人挂 pstore，内核的崩溃记录一直看不到；这里挂一下并把结果记下来。
 fn open_pstore() {
     let out = std::process::Command::new("/system/bin/sh")
@@ -817,7 +798,6 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
         for file in &cfg.firmware {
             place(file)?;
         }
-        calm_the_driver(cfg);
         for path in skyward_modules::load(modules, &cfg.modules)? {
             skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
         }
