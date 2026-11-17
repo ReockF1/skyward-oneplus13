@@ -118,8 +118,23 @@ fn mirror_kernel_log() {
     });
 }
 
+/// 未解密时 /sdcard 只是 ramdisk 里的一层壳，日志无处可写；把 /metadata 挂成
+/// 可写，那边的记录能活过重启，也就不用先解 /data 才能留证据。
+fn mount_metadata_for_log() -> bool {
+    let at = Path::new("/metadata");
+    if skyward_block::mount::is_mount_point(at).unwrap_or(false) {
+        return true;
+    }
+    let device = Path::new(skyward_block::BY_NAME).join("metadata");
+    if fs::create_dir_all(at).is_err() {
+        return false;
+    }
+    skyward_block::mount::mount(&device, at, "f2fs", &[]).is_ok()
+}
+
 /// 认一遍能写的落盘目录，认出来的每个都留着。
 fn reopen_mirror() -> Vec<PathBuf> {
+    mount_metadata_for_log();
     let mut out = Vec::new();
     for at in MIRROR {
         let dir = Path::new(at);
