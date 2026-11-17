@@ -38,7 +38,8 @@ const HOME: &str = "/skyward/run/supplicant";
 
 
 /// Where the last lines of the kernel log are kept while the WLAN comes up.
-const MIRROR: &str = "/sdcard/Skyward/wlan-diag";
+/// 未加密的 /metadata 排在前面：它不过 data 那套加解密，休眠前后更稳。
+const MIRROR: [&str; 2] = ["/metadata/skyward/wlan-diag", "/sdcard/Skyward/wlan-diag"];
 
 /// How many of the kernel log's last lines are kept there.
 const MIRROR_LINES: usize = 1500;
@@ -77,46 +78,68 @@ fn mirror_kernel_log() {
         return;
     }
     thread::spawn(|| {
-        let mut into: Option<(PathBuf, u64)> = None;
+        let mut kept: Vec<PathBuf> = Vec::new();
+        let mut sdcard = fs::metadata("/sdcard").ok().map(|m| m.dev());
+        let mut last = Instant::now();
+        let mut beat = Instant::now();
         loop {
-            // 解密之前 /sdcard 只是 ramdisk 里的一层壳，解密之后才换成真的 data；
-            // 设备号一变就重新认一次，免得一直往那层壳里写。
-            let root = fs::metadata("/sdcard").ok().map(|m| m.dev());
-            let stale = match (&into, root) {
-                (Some((_, kept)), Some(now)) => *kept != now,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            if stale {
-                into = None;
-            }
-            if into.is_none() {
-                let dir = Path::new(MIRROR);
-                if fs::create_dir_all(dir).is_ok() && fs::write(dir.join("probe"), b"").is_ok() {
-                    if let Some(dev) = root {
-                        let _ = skyward_sys::kmsg(&format!("wlan: keeping the kernel log in {MIRROR}"));
-                        into = Some((dir.to_path_buf(), dev));
-                    }
+            // 解密之前 /sdcard 只是 ramdisk 里的一层壳；设备号一变就重新认一遍。
+            let now = fs::metadata("/sdcard").ok().map(|m| m.dev());
+            if now != sdcard || kept.is_empty() {
+                sdcard = now;
+                kept = reopen_mirror();
+                for dir in &kept {
+                    let _ = skyward_sys::kmsg(&format!("wlan: keeping the kernel log in {}", dir.display()));
                 }
             }
-            if let Some((dir, _)) = &into {
-                if let Ok(text) = skyward_sys::kernel_log() {
-                    let kept: Vec<&str> = text.lines().filter(|line| !MIRROR_NOISE.iter().any(|noise| line.contains(noise))).collect();
-                    let from = kept.len().saturating_sub(MIRROR_LINES);
-                    let body = kept[from..].join("\n");
-                    let tmp = dir.join("tail.tmp");
-                    if let Ok(mut file) = fs::File::create(&tmp) {
-                        if file.write_all(body.as_bytes()).is_ok() {
-                            let _ = file.sync_all();
-                            drop(file);
-                            let _ = fs::rename(&tmp, dir.join("tail.log"));
-                        }
-                    }
+            if let Ok(text) = skyward_sys::kernel_log() {
+                let lines: Vec<&str> = text.lines().filter(|line| !MIRROR_NOISE.iter().any(|noise| line.contains(noise))).collect();
+                let from = lines.len().saturating_sub(MIRROR_LINES);
+                let body = lines[from..].join("\n");
+                let mut wrote = false;
+                for dir in &kept {
+                    wrote |= save_log(dir, &body);
                 }
+                if wrote {
+                    // 休眠会把这条线程冻住；醒来第一件事就是把缺口记下来，别让断档无声无息。
+                    let gap = last.elapsed().as_secs();
+                    if gap > 5 {
+                        let _ = skyward_sys::kmsg(&format!("wlan: the log went unwritten for {gap} s"));
+                    }
+                    last = Instant::now();
+                }
+            }
+            if beat.elapsed().as_secs() >= 20 {
+                beat = Instant::now();
+                let _ = skyward_sys::kmsg(&format!("wlan: mirror beat, {} folders hold the log", kept.len()));
             }
             thread::sleep(Duration::from_millis(300));
         }
     });
+}
+
+/// 认一遍能写的落盘目录，认出来的每个都留着。
+fn reopen_mirror() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for at in MIRROR {
+        let dir = Path::new(at);
+        if fs::create_dir_all(dir).is_ok() && fs::write(dir.join("probe"), b"").is_ok() {
+            out.push(dir.to_path_buf());
+        }
+    }
+    out
+}
+
+/// 先写 tmp、sync、再改名：崩在中间也留下完整的一份。
+fn save_log(dir: &Path, body: &str) -> bool {
+    let tmp = dir.join("tail.tmp");
+    let Ok(mut file) = fs::File::create(&tmp) else { return false };
+    if file.write_all(body.as_bytes()).is_err() {
+        return false;
+    }
+    let _ = file.sync_all();
+    drop(file);
+    fs::rename(&tmp, dir.join("tail.log")).is_ok()
 }
 
 /// The user the supplicant takes on as it starts, who has to be able to
@@ -762,9 +785,13 @@ fn place(file: &Firmware) -> Result<()> {
 /// Tell the last lines of the supplicant's own log into the kernel log, so a
 /// copy of kernel.log carries why it ended without opening a file by hand.
 fn tell_log(path: &Path) {
-    // 原样留一份在卡上，重启后还能逐行看，不受内核日志那几百行的窗口限制。
-    let _ = fs::create_dir_all(MIRROR);
-    let _ = fs::copy(path, Path::new(MIRROR).join("wpa_supplicant.log"));
+    // 原样留一份在盘上，重启后还能逐行看，不受内核日志那几百行的窗口限制。
+    for at in MIRROR {
+        let dir = Path::new(at);
+        if fs::create_dir_all(dir).is_ok() {
+            let _ = fs::copy(path, dir.join("wpa_supplicant.log"));
+        }
+    }
     match fs::read_to_string(path) {
         Ok(text) => {
             let lines: Vec<&str> = text.lines().collect();
