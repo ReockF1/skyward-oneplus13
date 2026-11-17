@@ -786,7 +786,17 @@ impl Station {
 /// 硬复位不经过 panic，什么都留不下。让可能存在的 oops 直接升级成 panic：
 /// 只有真出了 oops 才会触发，平时没有任何影响；一旦触发，ramoops 也许能落一份。
 fn arm_the_kernel() {
-    for (path, value) in [("/proc/sys/kernel/panic_on_oops", "1"), ("/proc/sys/kernel/panic", "20")] {
+    // oops 仍然升级成 panic（配合 cmdline 的 always_kmsg_dump 落进 ramoops）；
+    // 但 RCU stall 先不要直接 panic——让它把整机各 CPU 的栈打出来，我们才有得看。
+    let settings = [
+        ("/proc/sys/kernel/panic_on_oops", "1"),
+        ("/proc/sys/kernel/panic", "20"),
+        ("/proc/sys/kernel/panic_on_rcu_stall", "0"),
+        ("/proc/sys/kernel/hung_task_all_cpu_backtrace", "1"),
+        ("/proc/sys/kernel/hung_task_timeout_secs", "60"),
+        ("/sys/module/rcupdate/parameters/rcu_cpu_stall_timeout", "10"),
+    ];
+    for (path, value) in settings {
         match fs::write(path, value) {
             Ok(()) => {
                 let _ = skyward_sys::kmsg(&format!("wlan: {path} set to {value}"));
