@@ -96,6 +96,16 @@ enum Cmd {
     },
     /// Tell what a package or image is, the way the installer reads it.
     Identify { file: PathBuf },
+    /// 把一个网址上的文件下到本地（恢复里自己下刷机包用）。
+    Fetch {
+        /// 网址，http 或 https 都行；不给就读 /sdcard/Download/fetch.txt 的第一行。
+        url: Option<String>,
+        /// 存到哪儿，例如 /sdcard/Download/ota.zip；不给就用网址里的文件名。
+        out: Option<PathBuf>,
+        /// DNS 服务器；不给就读 /etc/resolv.conf（连上网时由 Skyward 写）。
+        #[arg(long)]
+        dns: Vec<String>,
+    },
     /// Discard all a block device holds and write zeros over its start, as
     /// a factory reset erases the data partition.
     #[cfg(target_os = "android")]
@@ -223,11 +233,136 @@ enum Cmd {
     },
 }
 
+/// 网址没给保存路径时，用网址里最后一段当名字。
+fn default_out(url: &str) -> PathBuf {
+    let name = url.rsplit('/').find(|part| !part.is_empty()).unwrap_or("download.bin");
+    let clean = name.split(['?', '#']).next().unwrap_or("download.bin");
+    Path::new("/sdcard/Download").join(clean)
+}
+
+/// 恢复里打字费劲：把网址写进 /sdcard/Download/fetch.txt（第一行网址，
+/// 第二行可选的保存路径），命令就只剩 `dl` 两个字。
+fn job_file() -> Result<(String, PathBuf)> {
+    let at = Path::new("/sdcard/Download/fetch.txt");
+    let text = std::fs::read_to_string(at).with_context(|| {
+        format!("{} 里没有网址：第一行写网址，第二行可写保存路径", at.display())
+    })?;
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let url = lines.next().with_context(|| format!("{} 是空的", at.display()))?.to_string();
+    let out = match lines.next() {
+        Some(path) => PathBuf::from(path),
+        None => default_out(&url),
+    };
+    Ok((url, out))
+}
+
+/// 把一个网址上的文件下到本地：边下边落盘，断了可以从 `.part` 接着下。
+fn fetch(url: &str, out: &Path, dns: &[String]) -> Result<()> {
+    use std::fs::{self, OpenOptions};
+    use std::io::{Read, Write};
+    use std::net::Ipv4Addr;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let mut servers: Vec<Ipv4Addr> = Vec::new();
+    for said in dns {
+        servers.push(said.parse().with_context(|| format!("{said} is not an IPv4 address"))?);
+    }
+    if servers.is_empty() {
+        servers = nameservers();
+    }
+    if servers.is_empty() {
+        return Err(anyhow!("no DNS server known: connect the WLAN first, or pass --dns <address>"));
+    }
+    let agent = skyward_net::http::agent(Arc::new(Mutex::new(servers)));
+
+    let name = out.file_name().context("the file needs a name")?.to_os_string();
+    let part = out.with_file_name({ let mut n = name.clone(); n.push(".part"); n });
+    if let Some(dir) = out.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
+    }
+    let had = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    if had > 0 {
+        println!("{had} bytes were already there; asking for the rest");
+    }
+    let asked = if had > 0 {
+        agent.get(url).header("Range", &format!("bytes={had}-")).call()
+    } else {
+        agent.get(url).call()
+    };
+    let mut response = asked.with_context(|| format!("ask {url}"))?;
+    let code = response.status().as_u16();
+    if code != 200 && code != 206 {
+        return Err(anyhow!("{url} answered {code}"));
+    }
+    let rest = response.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    let total = rest.map(|n| n + if code == 206 { had } else { 0 });
+    let mut file = OpenOptions::new().create(true).append(true).open(&part).with_context(|| format!("make {}", part.display()))?;
+    if code == 200 && had > 0 {
+        file.set_len(0)?;
+    }
+    let mut reader = response.body_mut().with_config().limit(u64::MAX).reader();
+    let (mut done, mut told, mut synced) = (if code == 206 { had } else { 0 }, Instant::now(), done_of(had));
+    let mut chunk = vec![0u8; 1 << 20];
+    loop {
+        let n = reader.read(&mut chunk).with_context(|| format!("read from {url}"))?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&chunk[..n])?;
+        done += n as u64;
+        if told.elapsed() >= Duration::from_secs(2) {
+            told = Instant::now();
+            // 一行原地刷新，别把终端刷满屏
+            match total {
+                Some(t) => print!("\r{done} of {t} bytes ({:.1}%)", done as f64 * 100.0 / t as f64),
+                None => print!("\r{done} bytes"),
+            }
+            let _ = std::io::stdout().flush();
+        }
+        if done - synced >= 16 << 20 {
+            file.sync_data()?;
+            synced = done;
+        }
+    }
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&part, out).with_context(|| format!("move {} to {}", part.display(), out.display()))?;
+    if let Some(dir) = out.parent() {
+        if let Ok(folder) = fs::File::open(dir) {
+            let _ = folder.sync_all();
+        }
+    }
+    println!();
+    println!("{done} bytes in {}", out.display());
+    Ok(())
+}
+
+/// 写下来过多少，用来算下一次 sync 的间隔。
+fn done_of(n: u64) -> u64 { n }
+
+/// /etc/resolv.conf 里写的名字服务器。
+fn nameservers() -> Vec<std::net::Ipv4Addr> {
+    let mut out = Vec::new();
+    if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") {
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            if parts.next() == Some("nameserver") {
+                if let Some(address) = parts.next().and_then(|a| a.parse().ok()) {
+                    out.push(address);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn main() -> Result<()> {
     // init starts the recovery service by path with no arguments.
     let started_as = std::env::args_os().next().unwrap_or_default();
     let name = Path::new(&started_as).file_name().unwrap_or_default();
-    if name == "recovery" {
+    // 没有参数才是被 init 拉起来的恢复界面；带参数就当作命令行用。
+    if name == "recovery" && std::env::args_os().len() == 1 {
         return recovery();
     }
     // Install scripts run the commands linked to this binary by their names.
@@ -274,6 +409,14 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Identify { file } => identify(&file),
+        Cmd::Fetch { url, out, dns } => {
+            let job = match (url, out) {
+                (Some(url), Some(out)) => (url, out),
+                (Some(url), None) => { let at = default_out(&url); (url, at) }
+                _ => job_file()?,
+            };
+            fetch(&job.0, &job.1, &dns)
+        }
         Cmd::Mount => {
             let mounts = skyward_vab::mount_partitions(booted_slot()?)?;
             for d in &mounts.damaged {

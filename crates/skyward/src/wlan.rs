@@ -39,15 +39,14 @@ const HOME: &str = "/skyward/run/supplicant";
 
 /// Where the last lines of the kernel log are kept while the WLAN comes up.
 /// 未加密的 /metadata 排在前面：它不过 data 那套加解密，休眠前后更稳。
-const MIRROR: [&str; 1] = ["/sdcard/Skyward/wlan-diag"];
+const MIRROR: [&str; 2] = ["/metadata/skyward/wlan-diag", "/sdcard/Skyward/wlan-diag"];
 
 /// How many of the kernel log's last lines are kept there.
 const MIRROR_LINES: usize = 1500;
 
 /// 几路刷屏的东西：充电、审计、触摸、看门狗、以及 cnss 等 DMS 时每 56 毫秒
 /// 一条的那句。落盘时丢掉，免得把真正要看的几行挤出去。
-const MIRROR_NOISE: [&str; 16] = [
-    "DMS QMI connection not established",
+const MIRROR_NOISE: [&str; 15] = [
     "OPLUS_CHG",
     "audit: type=1400",
     "si-mo:",
@@ -71,6 +70,9 @@ const MIRROR_NOISE: [&str; 16] = [
 /// Whether the log is already being kept.
 static MIRRORED: AtomicBool = AtomicBool::new(false);
 
+/// Whether the link is already being kept warm.
+static KEEPING: AtomicBool = AtomicBool::new(false);
+
 /// Keep the kernel log's tail on the phone's own storage, refreshed every
 /// second, so a reset that never reaches the kernel's own crash dump still
 /// leaves the last second of what the driver said behind.
@@ -83,6 +85,7 @@ fn mirror_kernel_log() {
         let mut sdcard = fs::metadata("/sdcard").ok().map(|m| m.dev());
         let mut last = Instant::now();
         let mut beat = Instant::now();
+        let started = Instant::now();
         loop {
             // 解密之前 /sdcard 只是 ramdisk 里的一层壳；设备号一变就重新认一遍。
             let now = fs::metadata("/sdcard").ok().map(|m| m.dev());
@@ -114,7 +117,9 @@ fn mirror_kernel_log() {
                 beat = Instant::now();
                 let _ = skyward_sys::kmsg(&format!("wlan: mirror beat, {} folders hold the log", kept.len()));
             }
-            thread::sleep(Duration::from_millis(1000));
+            // 前 60 秒抓得密一点：崩溃都在 supplicant 起来后的几秒里。
+            let every = if started.elapsed().as_secs() < 60 { 200 } else { 1000 };
+            thread::sleep(Duration::from_millis(every));
         }
     });
 }
@@ -128,8 +133,38 @@ fn sync_dir(dir: &Path) {
     }
 }
 
+/// 未解密时 /sdcard 只是 ramdisk 里的一层壳；/metadata 是 f2fs 明文分区，
+/// 把它挂成可写，日志就能活过重启，不用先解 /data。
+fn mount_metadata_for_log() {
+    let at = Path::new("/metadata");
+    let folder = at.join("skyward/wlan-diag");
+    let probe = folder.join("probe");
+    if fs::create_dir_all(&folder).is_ok() && fs::write(&probe, b"").is_ok() {
+        sync_dir(&folder);
+        return;
+    }
+    if skyward_block::mount::is_mount_point(at).unwrap_or(false) {
+        if let Err(e) = skyward_block::mount::umount(at) {
+            let _ = skyward_sys::kmsg(&format!("wlan: cannot unmount /metadata: {e:#}"));
+        }
+    }
+    let device = Path::new(skyward_block::BY_NAME).join("metadata");
+    match skyward_block::mount::mount(&device, at, "f2fs", &[]) {
+        Ok(()) => {
+            let _ = skyward_sys::kmsg("wlan: /metadata is mounted writable for the log");
+            if fs::create_dir_all(&folder).is_ok() {
+                sync_dir(&folder);
+            }
+        }
+        Err(e) => {
+            let _ = skyward_sys::kmsg(&format!("wlan: cannot mount {}: {e:#}", device.display()));
+        }
+    }
+}
+
 /// 认一遍能写的落盘目录，认出来的每个都留着。
 fn reopen_mirror() -> Vec<PathBuf> {
+    mount_metadata_for_log();
     let mut out = Vec::new();
     for at in MIRROR {
         let dir = Path::new(at);
@@ -619,8 +654,10 @@ impl Station {
         if let Some(j) = &mut self.state.joined {
             j.stage = Stage::Connected(link);
         }
+        write_resolv(&r.lease.as_ref().map(|held| held.lease.dns.clone()).unwrap_or_default());
         if let Some(dns) = look {
-            self.probe(dns);
+            self.probe(dns.clone());
+            keep_alive(self.cfg.probe.clone(), dns);
         }
         self.poll_link();
     }
@@ -761,6 +798,36 @@ fn arm_the_kernel() {
     }
 }
 
+/// cnss2 一直在等 DMS QMI（那句 `DMS QMI connection not established`），
+/// 而 DMS 由 /vendor/bin/cnss-daemon 提供，恢复里从来没起过它。
+fn start_cnss_daemon() {
+    let at = Path::new("/vendor/bin/cnss-daemon");
+    if !at.exists() {
+        let _ = skyward_sys::kmsg("wlan: /vendor/bin/cnss-daemon is not there");
+        return;
+    }
+    let log = Path::new("/sdcard/Skyward/wlan-diag");
+    let _ = fs::create_dir_all(log);
+    let held = fs::File::create(log.join("cnss-daemon.log")).ok();
+    let mut cmd = std::process::Command::new(at);
+    cmd.env("LD_LIBRARY_PATH", "/vendor/lib64:/system/lib64")
+        .current_dir("/")
+        .stdin(Stdio::null());
+    if let Some(file) = held.and_then(|f| f.try_clone().ok().map(|c| (f, c))) {
+        cmd.stdout(Stdio::from(file.0)).stderr(Stdio::from(file.1));
+    } else {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    match cmd.spawn() {
+        Ok(child) => {
+            let _ = skyward_sys::kmsg(&format!("wlan: cnss-daemon started as pid {}", child.id()));
+        }
+        Err(e) => {
+            let _ = skyward_sys::kmsg(&format!("wlan: cannot start cnss-daemon: {e}"));
+        }
+    }
+}
+
 fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
     mirror_kernel_log();
     arm_the_kernel();
@@ -769,6 +836,7 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
         for file in &cfg.firmware {
             place(file)?;
         }
+        start_cnss_daemon();
         for path in skyward_modules::load(modules, &cfg.modules)? {
             skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
         }
@@ -816,6 +884,36 @@ fn place(file: &Firmware) -> Result<()> {
 /// Start the supplicant on the interface, and wait for its control socket.
 /// Tell the last lines of the supplicant's own log into the kernel log, so a
 /// copy of kernel.log carries why it ended without opening a file by hand.
+/// 把网络给的 DNS 写进 /etc/resolv.conf：终端里手敲命令下载时用得上。
+fn write_resolv(dns: &[Ipv4Addr]) {
+    if dns.is_empty() {
+        return;
+    }
+    let text: String = dns.iter().map(|a| format!("nameserver {a}\n")).collect();
+    match fs::write("/etc/resolv.conf", &text) {
+        Ok(()) => {
+            let _ = skyward_sys::kmsg(&format!("wlan: /etc/resolv.conf set to {}", text.replace('\n', " ")));
+        }
+        Err(e) => {
+            let _ = skyward_sys::kmsg(&format!("wlan: cannot write /etc/resolv.conf: {e}"));
+        }
+    }
+}
+
+/// 每隔 20 秒探一次网；只做一次，之后自己转圈。
+fn keep_alive(page: String, dns: Vec<Ipv4Addr>) {
+    if KEEPING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    thread::spawn(move || {
+        loop {
+            let reach = reach::probe(&page, &dns);
+            let _ = skyward_sys::kmsg(&format!("wlan: keepalive: {reach}"));
+            thread::sleep(Duration::from_secs(20));
+        }
+    });
+}
+
 fn tell_log(path: &Path) {
     // 原样留一份在盘上，重启后还能逐行看，不受内核日志那几百行的窗口限制。
     for at in MIRROR {
@@ -840,19 +938,23 @@ fn tell_log(path: &Path) {
 }
 
 /// 真系统库在恢复里的位置；有它才说明是这台的布局。
+#[allow(dead_code)]
 const REAL_LIB: &str = "/mnt/system/system/lib64";
 
 /// 真系统里那份 libbinder：libbinder_ndk 要的 setTransactionCodeMap 只有它有。
 /// 先按整条路径装进来，厂商那几个 hidl/ndk 库按 soname 就会复用它，不会再多出一份。
+#[allow(dead_code)]
 const REAL_BINDER: &str = "/mnt/system/system/lib64/libbinder.so";
 
 /// 恢复里的链接器配置：写出来，厂商的 supplicant 就按 system/vendor 两个
 /// 命名空间各取各的库，和真系统一样。
+#[allow(dead_code)]
 const LINKER_CONFIG: &str = "/linkerconfig/ld.config.txt";
 
 /// 一份最小的命名空间配置：厂商二进制落在 vendor 命名空间（/vendor/lib64、
 /// /odm/lib64），系统库通过 links 从真系统那份取；libc 这类还在 APEX 里的，
 /// 退回 ramdisk 自己那层。
+#[allow(dead_code)]
 const LINKER_CONFIG_TEXT: &str = "\
 dir.system = /system/bin\n\
 dir.system = /mnt/system/system/bin\n\
@@ -884,6 +986,7 @@ namespace.system.permitted.paths += /system\n";
 
 /// 把上面那份写进 /linkerconfig/ld.config.txt；写成了就返回 true。
 /// 只在这台的挂载布局下写：别的机型没有 /mnt/system/system，就不会被动到。
+#[allow(dead_code)]
 fn write_linker_config() -> bool {
     if !Path::new(REAL_LIB).is_dir() {
         return false;
@@ -898,6 +1001,7 @@ fn write_linker_config() -> bool {
 
 /// 起完 supplicant 就把配置撤掉：它只在 exec 时读一次，留在那儿会让
 /// 之后起的每一个进程（HIDL 服务、安装脚本…）都套上命名空间。
+#[allow(dead_code)]
 fn drop_linker_config() {
     let _ = fs::remove_file(LINKER_CONFIG);
 }
@@ -910,8 +1014,8 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
     std::os::unix::fs::chown(&sockets, Some(WIFI), Some(WIFI)).with_context(|| format!("give {} to the supplicant", sockets.display()))?;
     fs::set_permissions(&sockets, fs::Permissions::from_mode(0o770)).with_context(|| format!("keep {} to the supplicant", sockets.display()))?;
     let settings = home.join("wpa_supplicant.conf");
-    fs::write(&settings, format!("ctrl_interface={}\nupdate_config=0\np2p_disabled=1\npmf=1\nsae_pwe=2\n", sockets.display()))
-        .with_context(|| format!("write {}", settings.display()))?;
+    let text = format!("ctrl_interface={}\nupdate_config=0\np2p_disabled=1\npmf=1\nsae_pwe=2\n", sockets.display());
+    fs::write(&settings, text).with_context(|| format!("write {}", settings.display()))?;
     fs::set_permissions(&settings, fs::Permissions::from_mode(0o644)).with_context(|| format!("open {} to the supplicant", settings.display()))?;
     let socket = sockets.join(&cfg.interface);
     // One an earlier run left would answer nothing.
@@ -940,7 +1044,6 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
     // 恢复里没有 /linkerconfig/ld.config.txt，所以所有库挤在一个命名空间里，
     // 新版系统库和厂商库会互相要求对方没有的符号。自己写一份最小的：厂商二进制
     // 走 vendor 命名空间（libbinder 只此一份），系统库经 links 从真系统那份取。
-    let namespaces = write_linker_config();
     let mut cmd = Process::new(&cfg.supplicant);
     cmd.args(["-i", &cfg.interface, "-D", "nl80211", "-c"])
         .arg(&settings)
@@ -948,28 +1051,13 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file(&home.join("wpa_supplicant.log"))?))
         .stderr(Stdio::from(log_file(&home.join("wpa_supplicant.log"))?));
-    let real_binder = Path::new(REAL_BINDER);
-    if namespaces {
-        // 命名空间自己会去找，不设 LD_LIBRARY_PATH，免得又把它压成一份。
-        let _ = skyward_sys::kmsg(&format!("supplicant: namespaces from {} written", LINKER_CONFIG));
-    } else {
-        cmd.env("LD_LIBRARY_PATH", &env_path);
-        if real_binder.exists() {
-            cmd.env("LD_PRELOAD", REAL_BINDER);
-        }
-        let _ = skyward_sys::kmsg(&format!(
-            "supplicant: LD_LIBRARY_PATH={env_path}, preload {REAL_BINDER} {}",
-            if real_binder.exists() { "set" } else { "missing" }
-        ));
-    }
+    cmd.env("LD_LIBRARY_PATH", &env_path);
+    let _ = skyward_sys::kmsg(&format!("supplicant: LD_LIBRARY_PATH={env_path}"));
     for probe in ["libapexsupport.so", "libbinder.so", "libbinder_ndk.so", "libc++.so", "liblog.so", "libc.so", "libbase.so"] {
         let found = path.iter().map(|dir| format!("{dir}/{probe}")).find(|at| Path::new(at).exists());
         let _ = skyward_sys::kmsg(&format!("supplicant: {probe} at {found:?}"));
     }
     let mut child = cmd.spawn().with_context(|| format!("start {}", cfg.supplicant))?;
-    if namespaces {
-        drop_linker_config();
-    }
     let until = Instant::now() + SOCKET_WAIT;
     while !socket.exists() {
         if let Some(status) = child.try_wait().context("look at wpa_supplicant")? {
