@@ -73,6 +73,12 @@ static MIRRORED: AtomicBool = AtomicBool::new(false);
 /// Whether the link is already being kept warm.
 static KEEPING: AtomicBool = AtomicBool::new(false);
 
+/// 恢复一起来就开始留证：不管有没有开 WiFi，日志与内核处置都先就位。
+pub fn start_diagnostics() {
+    mirror_kernel_log();
+    arm_the_kernel();
+}
+
 /// Keep the kernel log's tail on the phone's own storage, refreshed every
 /// second, so a reset that never reaches the kernel's own crash dump still
 /// leaves the last second of what the driver said behind.
