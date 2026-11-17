@@ -89,6 +89,41 @@ static KEEPING: AtomicBool = AtomicBool::new(false);
 pub fn start_diagnostics() {
     mirror_kernel_log();
     arm_the_kernel();
+    probe_ramoops();
+}
+
+/// 把 ramoops / pstore 这条链的实情问清楚：模块到底加载没有、pstore 里有没有上
+/// 一次崩溃的记录。有就抄进内核日志，这样即便 pstore 下次被清掉也还在盘上。
+fn probe_ramoops() {
+    let script = r#"
+lsmod | grep -q ramoops && echo 'ramoops already loaded'
+insmod /vendor/lib/modules/qcom_dynamic_ramoops.ko 2>&1 | head -3
+lsmod | grep -i ramoops | head -2
+mkdir -p /sys/fs/pstore
+mount -t pstore pstore /sys/fs/pstore 2>&1 | head -2
+echo '--- pstore contents ---'
+ls -l /sys/fs/pstore 2>&1 | head -6
+for f in /sys/fs/pstore/*; do
+  [ -f "$f" ] || continue
+  echo "=== $f"
+  head -c 6000 "$f"
+  echo
+done
+echo '--- reserved memory ---'
+ls /proc/device-tree/reserved-memory 2>/dev/null | grep -i ramoops | head -3
+echo done
+"#;
+    match std::process::Command::new("/system/bin/sh").args(["-c", script]).output() {
+        Ok(said) => {
+            let text = String::from_utf8_lossy(&said.stdout);
+            for line in text.lines().take(400) {
+                let _ = skyward_sys::kmsg(&format!("ramoops: {line}"));
+            }
+        }
+        Err(e) => {
+            let _ = skyward_sys::kmsg(&format!("ramoops: cannot run the check: {e}"));
+        }
+    }
 }
 
 /// Keep the kernel log's tail on the phone's own storage, refreshed every
