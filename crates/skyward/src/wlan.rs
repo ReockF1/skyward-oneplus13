@@ -46,7 +46,7 @@ const MIRROR_LINES: usize = 1500;
 
 /// 几路刷屏的东西：充电、审计、触摸、看门狗、以及 cnss 等 DMS 时每 56 毫秒
 /// 一条的那句。落盘时丢掉，免得把真正要看的几行挤出去。
-const MIRROR_NOISE: [&str; 15] = [
+const MIRROR_NOISE: [&str; 26] = [
     "OPLUS_CHG",
     "audit: type=1400",
     "si-mo:",
@@ -65,6 +65,18 @@ const MIRROR_NOISE: [&str; 15] = [
     "bright_screen_check",
     "[OPLUS_WD]",
     "wcd_usbss",
+    // 开机那一分钟的硬件刷屏，一条有用信息都没有，却能把 1500 行窗口几秒填满
+    "ssc_interactive",
+    "kfifo is full",
+    "qcom,rpmh-regulator",
+    "sync_state() pending",
+    "cam_cc-sun",
+    "gdsc adf134c",
+    "libprocessgroup: CgroupMap",
+    "ueventd: firmware: attempted",
+    "qcom_q6v5_pas",
+    "eusb2-repeater",
+    "smcinvoke: qtee_release",
 ];
 
 /// Whether the log is already being kept.
