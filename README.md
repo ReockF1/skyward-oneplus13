@@ -13,7 +13,7 @@
 | data 解密（FBE） | ✅ |
 | MTP 文件传输 | ✅ |
 | 震动 | ⚪ 默认关闭（配置未启用 `[haptics]`） |
-| WiFi | ❌ 未实现（上游无 `unblock`） |
+| WiFi | ⚠️ 可用但不稳定（扫描 / WPA2·WPA3 / DHCP / 联网 / 7～10 MB/s 下载均已实测；存在随机内核 panic，见“已知问题”） |
 
 ## 设备事实
 
@@ -73,7 +73,9 @@ python3 build/build_our.py
 
 ## 已知问题
 
-- **WiFi**：`Wlan` 结构缺 `unblock`，源码里无任何 rfkill 解除实现。
+- **WiFi 会随机 panic（当前最大阻塞项）**：功能已打通（扫描 46 BSS、WPA2/WPA3 四次握手、DHCP、联网、`dl` 下载实测 7.4～10.3 MB/s，最大一次下到 1.84 GB），但存在两类**内核 panic**：①连接瞬间（48～50 秒）；②连上后约 300 秒。两者都已确认是 `kernel crash`（`/proc/last_boot_reason`），但恢复环境里拿不到 panic 文本（`pstore` 无 console 记录、`rawdump` 全 0、minidump 的动态栈未启用）。
+- **WiFi 库依赖**：必须让 `wpa_supplicant` 跑在**恢复自己的 `/system/lib64`** 上（`libraries = ["/system/lib64", "/vendor/lib64"]`，与上游 21 个机型一致）。顺序反过来会拉进厂商 `libbinder.so`，它依赖恢复里没有的 `libapexsupport.so`。
+- **最低电量要求**：电量约 40%（3.68 V）时射频校准起不来（日志里连 `Calibration took` 都没有），建议 60% 以上或插充电器。
 - **双系统**：可把完整 OTA 装到另一槽并启动，但合并需恢复侧执行；运行中的 ColorOS 无 `snapshotctl`，会长期停在“更新未写入完成”。清理方法见 `docs/port-report.md` 第 14 节。
 - **HyperOS**：无法装入现有分区（`product` 需 5.94 GB，本机仅 0.16 GB），只能整机线刷。
 
