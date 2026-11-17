@@ -90,10 +90,33 @@ pub fn start_diagnostics() {
     mirror_kernel_log();
     arm_the_kernel();
     probe_ramoops();
+    probe_ipa("at start");
 }
 
 /// 把 ramoops / pstore 这条链的实情问清楚：模块到底加载没有、pstore 里有没有上
 /// 一次崩溃的记录。有就抄进内核日志，这样即便 pstore 下次被清掉也还在盘上。
+/// IPA 的性能管理是按 client 句柄投票的。把这张表抄下来，就能对比
+/// “恢复里 WLAN 投票时，表里到底有没有它的 client”。
+fn probe_ipa(when: &str) {
+    let script = r#"
+mkdir -p /sys/kernel/debug
+mount -t debugfs none /sys/kernel/debug 2>/dev/null
+echo '--- ipa dir ---'
+ls /sys/kernel/debug/ipa 2>/dev/null | head -8
+echo '--- active_clients ---'
+cat /sys/kernel/debug/ipa/active_clients 2>/dev/null | head -24
+echo '--- clk_rate / low power ---'
+cat /sys/kernel/debug/ipa/clk_rate 2>/dev/null | head -3
+echo done
+"#;
+    if let Ok(said) = std::process::Command::new("/system/bin/sh").args(["-c", script]).output() {
+        let text = String::from_utf8_lossy(&said.stdout);
+        for line in text.lines().take(120) {
+            let _ = skyward_sys::kmsg(&format!("ipa({when}): {line}"));
+        }
+    }
+}
+
 fn probe_ramoops() {
     let script = r#"
 lsmod | grep -q ramoops && echo 'ramoops already loaded'
@@ -944,6 +967,7 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
             thread::sleep(Duration::from_millis(100));
         }
     }
+    probe_ipa("after wlan up");
     iface::set_up(&cfg.interface, true)
 }
 
