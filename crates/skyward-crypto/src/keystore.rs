@@ -67,7 +67,8 @@ impl StoredKey {
         let read = |name: &str| fs::read(dir.join(name)).with_context(|| format!("read {}", dir.join(name).display()));
         let version = fs::read_to_string(dir.join(FN_VERSION)).with_context(|| format!("read {}", dir.join(FN_VERSION).display()))?;
         if version.trim() != VERSION {
-            bail!("{} is written in layout {}, Skyward reads layout {VERSION}", dir.display(), version.trim());
+            // 别的 layout 号不再当死路：按已知的文件名照读，读不动再由下游报错。
+            eprintln!("{} is written in layout {}, Skyward reads layout {VERSION}: reading it anyway", dir.display(), version.trim());
         }
         if dir.join(FN_STRETCHING).exists() {
             bail!("{} was written by an Android too old for Skyward to read", dir.display());
@@ -222,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_in_an_older_layout_is_refused() {
+    fn a_directory_in_another_layout_is_read_anyway() {
         let dir = tempdir("older-layout");
         fs::write(dir.join(FN_VERSION), "1").unwrap();
         fs::write(dir.join(FN_ENCRYPTED_KEY), [0u8; 64]).unwrap();
@@ -230,7 +231,7 @@ mod tests {
         assert!(refusal(&dir).contains("too old"), "{}", refusal(&dir));
         fs::remove_file(dir.join(FN_STRETCHING)).unwrap();
         fs::write(dir.join(FN_VERSION), "2").unwrap();
-        assert!(refusal(&dir).contains("layout 2"), "{}", refusal(&dir));
+        assert!(StoredKey::load(&dir).is_ok(), "another layout is read anyway");
     }
 
     #[test]

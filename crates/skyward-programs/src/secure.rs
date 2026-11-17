@@ -240,7 +240,13 @@ fn weaver(phone: &Phone) -> Result<Vec<Step>> {
     let mut out = Vec::new();
     let program = behind(phone, "the weaver", WEAVER, |file| file.contains("weaver-service"))?;
     let file = file_name(program);
-    let (_, through) = WEAVERS.iter().find(|(ending, _)| file.ends_with(ending)).with_context(|| format!("{} is a weaver of a make the recovery does not know", program.path))?;
+    let through = match WEAVERS.iter().find(|(ending, _)| file.ends_with(ending)) {
+        Some((_, through)) => through,
+        None => {
+            eprintln!("{file} is a weaver of a make the recovery does not know; trying the secure element anyway");
+            &Through::ElementService
+        }
+    };
     match through {
         Through::Own(interface) => {
             let own = phone

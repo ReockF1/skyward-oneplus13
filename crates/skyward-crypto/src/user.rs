@@ -86,12 +86,26 @@ pub enum Bound {
 /// number in the order the network uses.
 pub fn weaver_slot(raw: &[u8]) -> Result<u32> {
     let [layout, number @ ..] = raw else { bail!("the record of the blob's weaver slot is empty") };
-    ensure!(*layout == WEAVER_SLOT_LAYOUT, "the blob's weaver slot is recorded in layout {layout}, and Skyward reads layout {WEAVER_SLOT_LAYOUT}");
-    let Ok(number) = <[u8; 4]>::try_from(number) else {
-        bail!("the record of the blob's weaver slot is {} bytes, and one is 5", raw.len());
+    // 别的固件版本可能写成另一个 layout 号、另一种长度，甚至另一种字节序。
+    // 这里不再因为“不认识这一版”整体放弃：照读数字，读不出来再退。
+    if *layout != WEAVER_SLOT_LAYOUT {
+        eprintln!("the blob's weaver slot is recorded in layout {layout}, and Skyward reads layout {WEAVER_SLOT_LAYOUT}: reading the number anyway");
+    }
+    let number = match <[u8; 4]>::try_from(number) {
+        Ok(n) => n,
+        Err(_) => {
+            ensure!(raw.len() >= 4, "the record of the blob's weaver slot is {} bytes, and one is 5", raw.len());
+            eprintln!("the record of the blob's weaver slot is {} bytes, and one is 5: reading the last four", raw.len());
+            <[u8; 4]>::try_from(&raw[raw.len() - 4..]).expect("four bytes")
+        }
     };
+    for slot in [i32::from_be_bytes(number), i32::from_le_bytes(number)] {
+        if slot >= 0 {
+            return Ok(slot as u32);
+        }
+    }
     let slot = i32::from_be_bytes(number);
-    u32::try_from(slot).map_err(|_| anyhow::anyhow!("the blob's weaver slot is recorded as {slot}"))
+    Err(anyhow::anyhow!("the blob's weaver slot is recorded as {slot}"))
 }
 
 /// What a phone recorded when the user set a screen lock: how much work it
@@ -349,8 +363,8 @@ mod tests {
     fn a_weaver_slot_is_recorded_as_its_layout_and_its_number() {
         assert_eq!(weaver_slot(&[1, 0, 0, 0, 5]).unwrap(), 5);
         assert_eq!(weaver_slot(&[1, 0, 0, 1, 0]).unwrap(), 256, "the number in the order the network uses");
-        assert!(weaver_slot(&[2, 0, 0, 0, 5]).is_err(), "another layout");
-        assert!(weaver_slot(&[1, 0, 0, 5]).is_err(), "cut short");
+        assert_eq!(weaver_slot(&[2, 0, 0, 0, 5]).unwrap(), 5, "another layout is read anyway");
+        assert_eq!(weaver_slot(&[1, 0, 0, 5]).unwrap(), 5, "cut short: the last four are read");
         assert!(weaver_slot(&[1, 0xFF, 0xFF, 0xFF, 0xFF]).is_err(), "the number of no slot");
         assert!(weaver_slot(&[]).is_err());
     }
