@@ -129,9 +129,14 @@ fn mirror_kernel_log() {
                         let _ = skyward_sys::kmsg(&format!("wlan: the log went unwritten for {gap} s"));
                     }
                     last = Instant::now();
-                } else if last.elapsed().as_secs() > 10 {
-                    let _ = skyward_sys::kmsg(&format!("wlan: the log has not been written for {} s, {} folders", last.elapsed().as_secs(), kept.len()));
-                    last = Instant::now();
+                } else {
+                    // 写不进去（常见原因：Skyward 自己把 /metadata 临时挂成只读）。
+                    // 清空目标，下一轮 reopen_mirror() 会重挂并重新认一遍。
+                    kept.clear();
+                    if last.elapsed().as_secs() > 5 {
+                        let _ = skyward_sys::kmsg(&format!("wlan: the log has not been written for {} s; looking for the folders again", last.elapsed().as_secs()));
+                        last = Instant::now();
+                    }
                 }
             }
             if beat.elapsed().as_secs() >= 20 {
