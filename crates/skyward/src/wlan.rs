@@ -129,6 +129,9 @@ fn mirror_kernel_log() {
                         let _ = skyward_sys::kmsg(&format!("wlan: the log went unwritten for {gap} s"));
                     }
                     last = Instant::now();
+                } else if last.elapsed().as_secs() > 10 {
+                    let _ = skyward_sys::kmsg(&format!("wlan: the log has not been written for {} s, {} folders", last.elapsed().as_secs(), kept.len()));
+                    last = Instant::now();
                 }
             }
             if beat.elapsed().as_secs() >= 20 {
@@ -197,13 +200,27 @@ fn reopen_mirror() -> Vec<PathBuf> {
 /// 先写 tmp、sync、再改名：崩在中间也留下完整的一份。
 fn save_log(dir: &Path, body: &str) -> bool {
     let tmp = dir.join("tail.tmp");
-    let Ok(mut file) = fs::File::create(&tmp) else { return false };
-    if file.write_all(body.as_bytes()).is_err() {
+    let mut file = match fs::File::create(&tmp) {
+        Ok(file) => file,
+        Err(e) => {
+            let _ = skyward_sys::kmsg(&format!("wlan: cannot make {}: {e}", tmp.display()));
+            return false;
+        }
+    };
+    if let Err(e) = file.write_all(body.as_bytes()) {
+        let _ = skyward_sys::kmsg(&format!("wlan: cannot write {}: {e}", tmp.display()));
         return false;
     }
     let _ = file.sync_all();
     drop(file);
-    let moved = fs::rename(&tmp, dir.join("tail.log")).is_ok();
+    let at = dir.join("tail.log");
+    let moved = match fs::rename(&tmp, &at) {
+        Ok(()) => true,
+        Err(e) => {
+            let _ = skyward_sys::kmsg(&format!("wlan: cannot move the log to {}: {e}", at.display()));
+            false
+        }
+    };
     if moved {
         sync_dir(dir);
     }
