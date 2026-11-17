@@ -2213,9 +2213,23 @@ pub fn version_line(t: &Theme, f: &Fonts, text: &str) -> Sprite {
 /// How far below the version, in dp, the author's line stands.
 const AUTHOR_BELOW_DP: f32 = 19.0;
 
-/// Who made the recovery, a line under the version in its type.
+/// Who made the recovery, one or more lines under the version in its type;
+/// each line after the first stands a line's height lower and is centred too.
 pub fn author_line(t: &Theme, f: &Fonts, text: &str) -> Sprite {
-    hero_line(t, f, text, t.m.dp(AUTHOR_BELOW_DP))
+    let m = &t.m;
+    let px = m.dp(13.3);
+    let step = px * 1.35;
+    let lines: Vec<&str> = text.lines().collect();
+    let widest = lines.iter().map(|s| Canvas::new(0, 0).text_width(&f.body, s, px)).fold(0.0, f32::max);
+    let base = m.dp(296.3) + f.body.cap(px) + m.dp(AUTHOR_BELOW_DP);
+    let (left, top) = ((m.w as f32 - widest) / 2.0 - m.dp(2.0), base - px * 1.2);
+    let tall = px * 1.6 + step * lines.len().saturating_sub(1) as f32;
+    Sprite::capture(left, top, (widest + m.dp(4.0)).ceil() as u32, tall.ceil() as u32, |c, dx, dy| {
+        for (i, s) in lines.iter().enumerate() {
+            let w = Canvas::new(0, 0).text_width(&f.body, s, px);
+            c.text(&f.body, s, (m.w as f32 - w) / 2.0 + dx, base + dy + step * i as f32, px, Rgba::rgb(0, 0, 0), None);
+        }
+    })
 }
 
 /// A line centred under the About wordmark in the version's type, `below`

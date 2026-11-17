@@ -13,8 +13,10 @@ use skyward_net::supplicant::{self, Bss, Control, Event as Told, Security};
 use skyward_net::wlan::{self, Joined, Link, Next, Power, Stage, Traffic, Wlan};
 use skyward_sys::worker::{self, Teller};
 use std::fs;
+use std::io::Write;
 use std::net::Ipv4Addr;
 use std::os::fd::RawFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
@@ -34,13 +36,86 @@ const PARTITIONS: &str = "/skyward/wlan";
 /// recovery service's own folder.
 const HOME: &str = "/skyward/run/supplicant";
 
+
+/// Where the last lines of the kernel log are kept while the WLAN comes up.
+const MIRROR: &str = "/sdcard/Skyward/wlan-diag";
+
+/// How many of the kernel log's last lines are kept there.
+const MIRROR_LINES: usize = 1500;
+
+/// 几路刷屏的东西：充电、审计、触摸、看门狗、以及 cnss 等 DMS 时每 56 毫秒
+/// 一条的那句。落盘时丢掉，免得把真正要看的几行挤出去。
+const MIRROR_NOISE: [&str; 8] = [
+    "DMS QMI connection not established",
+    "OPLUS_CHG",
+    "audit: type=1400",
+    "si-mo:",
+    "tri_state_key",
+    "syna_",
+    "[wdog_util]",
+    "iostack:",
+];
+
+/// Whether the log is already being kept.
+static MIRRORED: AtomicBool = AtomicBool::new(false);
+
+/// Keep the kernel log's tail on the phone's own storage, refreshed every
+/// second, so a reset that never reaches the kernel's own crash dump still
+/// leaves the last second of what the driver said behind.
+fn mirror_kernel_log() {
+    if MIRRORED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    thread::spawn(|| {
+        let mut into: Option<(PathBuf, u64)> = None;
+        loop {
+            // 解密之前 /sdcard 只是 ramdisk 里的一层壳，解密之后才换成真的 data；
+            // 设备号一变就重新认一次，免得一直往那层壳里写。
+            let root = fs::metadata("/sdcard").ok().map(|m| m.dev());
+            let stale = match (&into, root) {
+                (Some((_, kept)), Some(now)) => *kept != now,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if stale {
+                into = None;
+            }
+            if into.is_none() {
+                let dir = Path::new(MIRROR);
+                if fs::create_dir_all(dir).is_ok() && fs::write(dir.join("probe"), b"").is_ok() {
+                    if let Some(dev) = root {
+                        let _ = skyward_sys::kmsg(&format!("wlan: keeping the kernel log in {MIRROR}"));
+                        into = Some((dir.to_path_buf(), dev));
+                    }
+                }
+            }
+            if let Some((dir, _)) = &into {
+                if let Ok(text) = skyward_sys::kernel_log() {
+                    let kept: Vec<&str> = text.lines().filter(|line| !MIRROR_NOISE.iter().any(|noise| line.contains(noise))).collect();
+                    let from = kept.len().saturating_sub(MIRROR_LINES);
+                    let body = kept[from..].join("\n");
+                    let tmp = dir.join("tail.tmp");
+                    if let Ok(mut file) = fs::File::create(&tmp) {
+                        if file.write_all(body.as_bytes()).is_ok() {
+                            let _ = file.sync_all();
+                            drop(file);
+                            let _ = fs::rename(&tmp, dir.join("tail.log"));
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(300));
+        }
+    });
+}
+
 /// The user the supplicant takes on as it starts, who has to be able to
 /// make its socket.
 const WIFI: u32 = 1010;
 
 /// How long the driver may take to make its interface, the chip's firmware
 /// loading meanwhile.
-const INTERFACE_WAIT: Duration = Duration::from_secs(20);
+const INTERFACE_WAIT: Duration = Duration::from_secs(60);
 
 /// How long the supplicant may take to open its control socket.
 const SOCKET_WAIT: Duration = Duration::from_secs(10);
@@ -623,6 +698,7 @@ impl Station {
 /// Load the driver where its interface is not there yet, and bring the
 /// interface up.
 fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
+    mirror_kernel_log();
     let net = Path::new("/sys/class/net").join(&cfg.interface);
     if !net.exists() {
         for file in &cfg.firmware {
@@ -637,9 +713,16 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
     for w in &cfg.writes {
             fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))?;
         }
-        let until = Instant::now() + INTERFACE_WAIT;
+        let start = Instant::now();
+        let until = start + INTERFACE_WAIT;
+        let mut next = 5u64;
         while !net.exists() {
             ensure!(Instant::now() < until, "the driver made no {} in {} seconds", cfg.interface, INTERFACE_WAIT.as_secs());
+            let waited = start.elapsed().as_secs();
+            if waited >= next {
+                let _ = skyward_sys::kmsg(&format!("still waiting for {}: {} of {} seconds", cfg.interface, waited, INTERFACE_WAIT.as_secs()));
+                next += 5;
+            }
             thread::sleep(Duration::from_millis(100));
         }
     }
@@ -666,6 +749,77 @@ fn place(file: &Firmware) -> Result<()> {
 }
 
 /// Start the supplicant on the interface, and wait for its control socket.
+/// Tell the last lines of the supplicant's own log into the kernel log, so a
+/// copy of kernel.log carries why it ended without opening a file by hand.
+fn tell_log(path: &Path) {
+    // 原样留一份在卡上，重启后还能逐行看，不受内核日志那几百行的窗口限制。
+    let _ = fs::create_dir_all(MIRROR);
+    let _ = fs::copy(path, Path::new(MIRROR).join("wpa_supplicant.log"));
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().collect();
+            let from = lines.len().saturating_sub(40);
+            for line in &lines[from..] {
+                let _ = skyward_sys::kmsg(&format!("wpa_supplicant: {line}"));
+            }
+            let _ = skyward_sys::kmsg(&format!("wpa_supplicant: {} lines in {}", lines.len(), path.display()));
+        }
+        Err(e) => {
+            let _ = skyward_sys::kmsg(&format!("wpa_supplicant: read {}: {e}", path.display()));
+        }
+    }
+}
+
+/// 真系统里那份 libbinder：libbinder_ndk 要的 setTransactionCodeMap 只有它有。
+/// 先按整条路径装进来，厂商那几个 hidl/ndk 库按 soname 就会复用它，不会再多出一份。
+const REAL_BINDER: &str = "/mnt/system/system/lib64/libbinder.so";
+
+/// 恢复里的链接器配置：写出来，厂商的 supplicant 就按 system/vendor 两个
+/// 命名空间各取各的库，和真系统一样。
+const LINKER_CONFIG: &str = "/linkerconfig/ld.config.txt";
+
+/// 一份最小的命名空间配置：厂商二进制落在 vendor 命名空间（/vendor/lib64、
+/// /odm/lib64），系统库通过 links 从真系统那份取；libc 这类还在 APEX 里的，
+/// 退回 ramdisk 自己那层。
+const LINKER_CONFIG_TEXT: &str = "\
+dir.system = /system/bin\n\
+dir.system = /mnt/system/system/bin\n\
+dir.vendor = /vendor/bin\n\
+dir.vendor = /odm/bin\n\
+\n\
+[system]\n\
+namespace.default.isolated = true\n\
+namespace.default.visible = true\n\
+namespace.default.search.paths = /mnt/system/system/${LIB}\n\
+namespace.default.search.paths += /system/${LIB}\n\
+namespace.default.permitted.paths = /mnt/system/system\n\
+namespace.default.permitted.paths += /system\n\
+\n\
+[vendor]\n\
+namespace.default.isolated = true\n\
+namespace.default.visible = true\n\
+namespace.default.search.paths = /vendor/${LIB}\n\
+namespace.default.search.paths += /odm/${LIB}\n\
+namespace.default.permitted.paths = /vendor\n\
+namespace.default.permitted.paths += /odm\n\
+namespace.default.links = system\n\
+namespace.system.isolated = true\n\
+namespace.system.visible = true\n\
+namespace.system.search.paths = /mnt/system/system/${LIB}\n\
+namespace.system.search.paths += /system/${LIB}\n\
+namespace.system.permitted.paths = /mnt/system/system\n\
+namespace.system.permitted.paths += /system\n";
+
+/// 把上面那份写进 /linkerconfig/ld.config.txt；写成了就返回 true。
+fn write_linker_config() -> bool {
+    let path = Path::new(LINKER_CONFIG);
+    let Some(dir) = path.parent() else { return false };
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    fs::write(path, LINKER_CONFIG_TEXT).is_ok()
+}
+
 fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
     let home = Path::new(HOME);
     let sockets = home.join("sockets");
@@ -686,23 +840,60 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
     if let Some(dir) = libraries {
         path.push(dir.to_string_lossy().into_owned());
     }
-    let mut child = Process::new(&cfg.supplicant)
-        .args(["-i", &cfg.interface, "-D", "nl80211", "-c"])
+    for at in ["/mnt/system", "/mnt/system/lib64", "/mnt/system/system", "/mnt/system/system/lib64"] {
+        let said = match fs::read_dir(at) {
+            Ok(dir) => {
+                let names: Vec<String> = dir
+                    .filter_map(|e| e.ok())
+                    .take(12)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                format!("{at} holds {names:?}")
+            }
+            Err(e) => format!("{at}: {e}"),
+        };
+        let _ = skyward_sys::kmsg(&format!("supplicant: {said}"));
+    }
+    let env_path = path.join(":");
+    // 恢复里没有 /linkerconfig/ld.config.txt，所以所有库挤在一个命名空间里，
+    // 新版系统库和厂商库会互相要求对方没有的符号。自己写一份最小的：厂商二进制
+    // 走 vendor 命名空间（libbinder 只此一份），系统库经 links 从真系统那份取。
+    let namespaces = write_linker_config();
+    let mut cmd = Process::new(&cfg.supplicant);
+    cmd.args(["-i", &cfg.interface, "-D", "nl80211", "-c"])
         .arg(&settings)
-        .env("LD_LIBRARY_PATH", path.join(":"))
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file(&home.join("wpa_supplicant.log"))?))
-        .stderr(Stdio::from(log_file(&home.join("wpa_supplicant.log"))?))
-        .spawn()
-        .with_context(|| format!("start {}", cfg.supplicant))?;
+        .stderr(Stdio::from(log_file(&home.join("wpa_supplicant.log"))?));
+    let real_binder = Path::new(REAL_BINDER);
+    if namespaces {
+        // 命名空间自己会去找，不设 LD_LIBRARY_PATH，免得又把它压成一份。
+        let _ = skyward_sys::kmsg(&format!("supplicant: namespaces from {} written", LINKER_CONFIG));
+    } else {
+        cmd.env("LD_LIBRARY_PATH", &env_path);
+        if real_binder.exists() {
+            cmd.env("LD_PRELOAD", REAL_BINDER);
+        }
+        let _ = skyward_sys::kmsg(&format!(
+            "supplicant: LD_LIBRARY_PATH={env_path}, preload {REAL_BINDER} {}",
+            if real_binder.exists() { "set" } else { "missing" }
+        ));
+    }
+    for probe in ["libapexsupport.so", "libbinder.so", "libbinder_ndk.so", "libc++.so", "liblog.so", "libc.so", "libbase.so"] {
+        let found = path.iter().map(|dir| format!("{dir}/{probe}")).find(|at| Path::new(at).exists());
+        let _ = skyward_sys::kmsg(&format!("supplicant: {probe} at {found:?}"));
+    }
+    let mut child = cmd.spawn().with_context(|| format!("start {}", cfg.supplicant))?;
     let until = Instant::now() + SOCKET_WAIT;
     while !socket.exists() {
         if let Some(status) = child.try_wait().context("look at wpa_supplicant")? {
+            tell_log(&home.join("wpa_supplicant.log"));
             bail!("wpa_supplicant ended as it started: {status}");
         }
         if Instant::now() >= until {
             end(&mut child, None);
+            tell_log(&home.join("wpa_supplicant.log"));
             bail!("wpa_supplicant opened no control socket in {} seconds", SOCKET_WAIT.as_secs());
         }
         thread::sleep(Duration::from_millis(100));
