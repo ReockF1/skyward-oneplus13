@@ -45,7 +45,7 @@ const MIRROR_LINES: usize = 1500;
 
 /// 几路刷屏的东西：充电、审计、触摸、看门狗、以及 cnss 等 DMS 时每 56 毫秒
 /// 一条的那句。落盘时丢掉，免得把真正要看的几行挤出去。
-const MIRROR_NOISE: [&str; 8] = [
+const MIRROR_NOISE: [&str; 16] = [
     "DMS QMI connection not established",
     "OPLUS_CHG",
     "audit: type=1400",
@@ -54,6 +54,16 @@ const MIRROR_NOISE: [&str; 8] = [
     "syna_",
     "[wdog_util]",
     "iostack:",
+    // 连上之后驱动会一直打漫游扫描的样表，几秒钟就把窗口填满
+    "[schedu]",
+    "CMN_MLME",
+    "ROAM",
+    // 系统侧的周期性噪声
+    "healthd:",
+    "black_screen_check",
+    "bright_screen_check",
+    "[OPLUS_WD]",
+    "wcd_usbss",
 ];
 
 /// Whether the log is already being kept.
