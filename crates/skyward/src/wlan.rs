@@ -122,17 +122,26 @@ fn mirror_kernel_log() {
 /// 可写，那边的记录能活过重启，也就不用先解 /data 才能留证据。
 fn mount_metadata_for_log() {
     let at = Path::new("/metadata");
-    if skyward_block::mount::is_mount_point(at).unwrap_or(false) {
+    let folder = at.join("skyward/wlan-diag");
+    let probe = folder.join("probe");
+    // 已经挂着但只读的话，建目录会失败；先试一次，不行就卸了重挂。
+    if fs::create_dir_all(&folder).is_ok() && fs::write(&probe, b"").is_ok() {
+        sync_dir(&folder);
         return;
+    }
+    let mounted = skyward_block::mount::is_mount_point(at).unwrap_or(false);
+    if mounted {
+        if let Err(e) = skyward_block::mount::umount(at) {
+            let _ = skyward_sys::kmsg(&format!("wlan: cannot unmount /metadata: {e:#}"));
+        }
     }
     let device = Path::new(skyward_block::BY_NAME).join("metadata");
-    if let Err(e) = fs::create_dir_all(at) {
-        let _ = skyward_sys::kmsg(&format!("wlan: cannot make {}: {e}", at.display()));
-        return;
-    }
     match skyward_block::mount::mount(&device, at, "f2fs", &[]) {
         Ok(()) => {
             let _ = skyward_sys::kmsg("wlan: /metadata is mounted writable for the log");
+            if let Ok(()) = fs::create_dir_all(&folder).map_err(|_| ()) {
+                sync_dir(&folder);
+            }
         }
         Err(e) => {
             let _ = skyward_sys::kmsg(&format!("wlan: cannot mount {}: {e:#}", device.display()));
