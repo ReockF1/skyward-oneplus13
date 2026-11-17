@@ -39,7 +39,7 @@ const HOME: &str = "/skyward/run/supplicant";
 
 /// Where the last lines of the kernel log are kept while the WLAN comes up.
 /// 未加密的 /metadata 排在前面：它不过 data 那套加解密，休眠前后更稳。
-const MIRROR: [&str; 2] = ["/metadata/skyward/wlan-diag", "/sdcard/Skyward/wlan-diag"];
+const MIRROR: [&str; 1] = ["/sdcard/Skyward/wlan-diag"];
 
 /// How many of the kernel log's last lines are kept there.
 const MIRROR_LINES: usize = 1500;
@@ -55,10 +55,11 @@ const MIRROR_NOISE: [&str; 16] = [
     "syna_",
     "[wdog_util]",
     "iostack:",
-    // 连上之后驱动会一直打漫游扫描的样表，几秒钟就把窗口填满
-    "[schedu]",
+    // 连上之后驱动会一直打漫游扫描的样表，几秒钟就把窗口填满；
+    // 注意别把 [schedu] 整个滤掉——扫描和连接的行也是这个前缀。
     "CMN_MLME",
-    "ROAM",
+    "ROAM INIT INFO",
+    "ROAM_SCAN",
     // 系统侧的周期性噪声
     "healthd:",
     "black_screen_check",
@@ -113,41 +114,12 @@ fn mirror_kernel_log() {
                 beat = Instant::now();
                 let _ = skyward_sys::kmsg(&format!("wlan: mirror beat, {} folders hold the log", kept.len()));
             }
-            thread::sleep(Duration::from_millis(300));
+            thread::sleep(Duration::from_millis(1000));
         }
     });
 }
 
 /// 未解密时 /sdcard 只是 ramdisk 里的一层壳，日志无处可写；把 /metadata 挂成
-/// 可写，那边的记录能活过重启，也就不用先解 /data 才能留证据。
-fn mount_metadata_for_log() {
-    let at = Path::new("/metadata");
-    let folder = at.join("skyward/wlan-diag");
-    let probe = folder.join("probe");
-    // 已经挂着但只读的话，建目录会失败；先试一次，不行就卸了重挂。
-    if fs::create_dir_all(&folder).is_ok() && fs::write(&probe, b"").is_ok() {
-        sync_dir(&folder);
-        return;
-    }
-    let mounted = skyward_block::mount::is_mount_point(at).unwrap_or(false);
-    if mounted {
-        if let Err(e) = skyward_block::mount::umount(at) {
-            let _ = skyward_sys::kmsg(&format!("wlan: cannot unmount /metadata: {e:#}"));
-        }
-    }
-    let device = Path::new(skyward_block::BY_NAME).join("metadata");
-    match skyward_block::mount::mount(&device, at, "f2fs", &[]) {
-        Ok(()) => {
-            let _ = skyward_sys::kmsg("wlan: /metadata is mounted writable for the log");
-            if let Ok(()) = fs::create_dir_all(&folder).map_err(|_| ()) {
-                sync_dir(&folder);
-            }
-        }
-        Err(e) => {
-            let _ = skyward_sys::kmsg(&format!("wlan: cannot mount {}: {e:#}", device.display()));
-        }
-    }
-}
 
 /// 目录项也要落盘：只 sync 文件的话，断电后 rename 出来的名字会丢。
 fn sync_dir(dir: &Path) {
@@ -158,7 +130,6 @@ fn sync_dir(dir: &Path) {
 
 /// 认一遍能写的落盘目录，认出来的每个都留着。
 fn reopen_mirror() -> Vec<PathBuf> {
-    mount_metadata_for_log();
     let mut out = Vec::new();
     for at in MIRROR {
         let dir = Path::new(at);
@@ -774,25 +745,9 @@ impl Station {
 
 /// Load the driver where its interface is not there yet, and bring the
 /// interface up.
-/// 恢复里没人挂 pstore，内核的崩溃记录一直看不到；这里挂一下并把结果记下来。
-fn open_pstore() {
-    let out = std::process::Command::new("/system/bin/sh")
-        .args(["-c", "mkdir -p /sys/fs/pstore; mount -t pstore pstore /sys/fs/pstore 2>&1; ls -l /sys/fs/pstore 2>&1 | head -4"])
-        .output();
-    match out {
-        Ok(said) => {
-            let text = String::from_utf8_lossy(&said.stdout).replace('\n', " | ");
-            let _ = skyward_sys::kmsg(&format!("wlan: pstore {text}"));
-        }
-        Err(e) => {
-            let _ = skyward_sys::kmsg(&format!("wlan: pstore could not be opened: {e}"));
-        }
-    }
-}
 
 fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
     mirror_kernel_log();
-    open_pstore();
     let net = Path::new("/sys/class/net").join(&cfg.interface);
     if !net.exists() {
         for file in &cfg.firmware {
