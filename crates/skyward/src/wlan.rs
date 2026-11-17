@@ -120,16 +120,31 @@ fn mirror_kernel_log() {
 
 /// 未解密时 /sdcard 只是 ramdisk 里的一层壳，日志无处可写；把 /metadata 挂成
 /// 可写，那边的记录能活过重启，也就不用先解 /data 才能留证据。
-fn mount_metadata_for_log() -> bool {
+fn mount_metadata_for_log() {
     let at = Path::new("/metadata");
     if skyward_block::mount::is_mount_point(at).unwrap_or(false) {
-        return true;
+        return;
     }
     let device = Path::new(skyward_block::BY_NAME).join("metadata");
-    if fs::create_dir_all(at).is_err() {
-        return false;
+    if let Err(e) = fs::create_dir_all(at) {
+        let _ = skyward_sys::kmsg(&format!("wlan: cannot make {}: {e}", at.display()));
+        return;
     }
-    skyward_block::mount::mount(&device, at, "f2fs", &[]).is_ok()
+    match skyward_block::mount::mount(&device, at, "f2fs", &[]) {
+        Ok(()) => {
+            let _ = skyward_sys::kmsg("wlan: /metadata is mounted writable for the log");
+        }
+        Err(e) => {
+            let _ = skyward_sys::kmsg(&format!("wlan: cannot mount {}: {e:#}", device.display()));
+        }
+    }
+}
+
+/// 目录项也要落盘：只 sync 文件的话，断电后 rename 出来的名字会丢。
+fn sync_dir(dir: &Path) {
+    if let Ok(folder) = fs::File::open(dir) {
+        let _ = folder.sync_all();
+    }
 }
 
 /// 认一遍能写的落盘目录，认出来的每个都留着。
@@ -139,6 +154,7 @@ fn reopen_mirror() -> Vec<PathBuf> {
     for at in MIRROR {
         let dir = Path::new(at);
         if fs::create_dir_all(dir).is_ok() && fs::write(dir.join("probe"), b"").is_ok() {
+            sync_dir(dir);
             out.push(dir.to_path_buf());
         }
     }
@@ -154,7 +170,11 @@ fn save_log(dir: &Path, body: &str) -> bool {
     }
     let _ = file.sync_all();
     drop(file);
-    fs::rename(&tmp, dir.join("tail.log")).is_ok()
+    let moved = fs::rename(&tmp, dir.join("tail.log")).is_ok();
+    if moved {
+        sync_dir(dir);
+    }
+    moved
 }
 
 /// The user the supplicant takes on as it starts, who has to be able to
