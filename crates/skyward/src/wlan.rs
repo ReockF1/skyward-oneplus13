@@ -770,6 +770,9 @@ fn tell_log(path: &Path) {
     }
 }
 
+/// 真系统库在恢复里的位置；有它才说明是这台的布局。
+const REAL_LIB: &str = "/mnt/system/system/lib64";
+
 /// 真系统里那份 libbinder：libbinder_ndk 要的 setTransactionCodeMap 只有它有。
 /// 先按整条路径装进来，厂商那几个 hidl/ndk 库按 soname 就会复用它，不会再多出一份。
 const REAL_BINDER: &str = "/mnt/system/system/lib64/libbinder.so";
@@ -811,13 +814,23 @@ namespace.system.permitted.paths = /mnt/system/system\n\
 namespace.system.permitted.paths += /system\n";
 
 /// 把上面那份写进 /linkerconfig/ld.config.txt；写成了就返回 true。
+/// 只在这台的挂载布局下写：别的机型没有 /mnt/system/system，就不会被动到。
 fn write_linker_config() -> bool {
+    if !Path::new(REAL_LIB).is_dir() {
+        return false;
+    }
     let path = Path::new(LINKER_CONFIG);
     let Some(dir) = path.parent() else { return false };
     if fs::create_dir_all(dir).is_err() {
         return false;
     }
     fs::write(path, LINKER_CONFIG_TEXT).is_ok()
+}
+
+/// 起完 supplicant 就把配置撤掉：它只在 exec 时读一次，留在那儿会让
+/// 之后起的每一个进程（HIDL 服务、安装脚本…）都套上命名空间。
+fn drop_linker_config() {
+    let _ = fs::remove_file(LINKER_CONFIG);
 }
 
 fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
@@ -885,6 +898,9 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
         let _ = skyward_sys::kmsg(&format!("supplicant: {probe} at {found:?}"));
     }
     let mut child = cmd.spawn().with_context(|| format!("start {}", cfg.supplicant))?;
+    if namespaces {
+        drop_linker_config();
+    }
     let until = Instant::now() + SOCKET_WAIT;
     while !socket.exists() {
         if let Some(status) = child.try_wait().context("look at wpa_supplicant")? {
